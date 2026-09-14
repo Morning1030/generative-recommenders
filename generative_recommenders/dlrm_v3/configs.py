@@ -29,9 +29,10 @@ from generative_recommenders.modules.multitask_module import (
 from torchrec.modules.embedding_configs import DataType, EmbeddingConfig
 
 HSTU_EMBEDDING_DIM = 512  # final DLRMv3 model
-HASH_SIZE = 10_000_000
-HASH_SIZE_1B = 1_000_000_000
-
+# HASH_SIZE = 10_000_000
+HASH_SIZE = 50_000_000
+# HASH_SIZE_1B = 1_000_000_000
+HASH_SIZE_1B = 50_000_000
 
 def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
     """

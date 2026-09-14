@@ -20,7 +20,18 @@ import os
 from typing import Tuple
 
 import torch
-from torchrec.modules.sorted_index_select import maybe_sorted_index_select
+# from torchrec.modules.sorted_index_select import maybe_sorted_index_select
+# from fbgemm_gpu.ops import sorted_index_select as maybe_sorted_index_select
+# from fbgemm_gpu.sparse_ops import sorted_index_select as maybe_sorted_index_select
+try:
+    from torchrec.modules.sorted_index_select import maybe_sorted_index_select
+except ImportError:
+    def maybe_sorted_index_select(
+        embeddings: torch.Tensor,
+        indices: torch.Tensor,
+        use_sorted: bool,
+    ) -> torch.Tensor:
+        return embeddings.index_select(0, indices)
 
 
 def _use_sorted_index_select() -> bool:

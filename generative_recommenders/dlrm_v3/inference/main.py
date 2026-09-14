@@ -180,66 +180,71 @@ class Runner:
             self.result_batches.append(len(qitem.query_ids))
         except Exception as ex:  # pylint: disable=broad-except
             logger.error("thread: failed, %s", ex)
-        finally:
-            # pyrefly: ignore [unbound-name]
-            candidate_size = mt_target_preds.size(1) // len(qitem.query_ids)
-            if not self.compute_eval:
-                for i, query_id in enumerate(qitem.query_ids):
-                    query_mt_target_preds = (
-                        mt_target_preds[  # pyre-ignore [61]
-                            0,
-                            candidate_size * i : candidate_size * (i + 1),
+            return
+        
+        if mt_target_preds is None:
+            logger.error("thread: model returned no predictions")
+            return
+
+        # pyrefly: ignore [unbound-name]
+        candidate_size = mt_target_preds.size(1) // len(qitem.query_ids)
+        if not self.compute_eval:
+            for i, query_id in enumerate(qitem.query_ids):
+                query_mt_target_preds = (
+                    mt_target_preds[  # pyre-ignore [61]
+                        0,
+                        candidate_size * i : candidate_size * (i + 1),
                         ]
                         .view(-1)
                         .float()
                         .numpy()
-                    )
-                    response_array = array.array("B", query_mt_target_preds.tobytes())
-                    bi = response_array.buffer_info()
-                    # since we send buffer to loadgen, needs `response_array` in memory during send
-                    lg.QuerySamplesComplete(
-                        [lg.QuerySampleResponse(query_id, bi[0], bi[1])]
-                    )
-            else:
-                for i, query_id in enumerate(qitem.query_ids):
-                    query_mt_target_preds = (
-                        mt_target_preds[  # pyre-ignore [61]
-                            0, candidate_size * i : candidate_size * (i + 1)
-                        ]
-                        .view(-1)
-                        .float()
-                        .numpy()
-                    )
-                    query_mt_target_labels = (
-                        mt_target_labels[  # pyre-ignore [16,61]
-                            0, candidate_size * i : candidate_size * (i + 1)
-                        ]
-                        .view(-1)
-                        .float()
-                        .numpy()
-                    )
-                    query_mt_target_weights = (
-                        mt_target_weights[  # pyre-ignore [61]
-                            0, candidate_size * i : candidate_size * (i + 1)
-                        ]
-                        .view(-1)
-                        .float()
-                        .numpy()
-                    )
-                    np_array = np.concatenate(
-                        [
-                            query_mt_target_preds,
-                            query_mt_target_labels,
-                            query_mt_target_weights,
-                            np.array([candidate_size]).astype(np.float32),
-                        ]
-                    )
-                    response_array = array.array("B", np_array.tobytes())
-                    bi = response_array.buffer_info()
-                    # since we send buffer to loadgen, needs `response_array` in memory during send
-                    lg.QuerySamplesComplete(
-                        [lg.QuerySampleResponse(query_id, bi[0], bi[1])]
-                    )
+                )
+                response_array = array.array("B", query_mt_target_preds.tobytes())
+                bi = response_array.buffer_info()
+                # since we send buffer to loadgen, needs `response_array` in memory during send
+                lg.QuerySamplesComplete(
+                    [lg.QuerySampleResponse(query_id, bi[0], bi[1])]
+                )
+        else:
+            for i, query_id in enumerate(qitem.query_ids):
+                query_mt_target_preds = (
+                    mt_target_preds[  # pyre-ignore [61]
+                        0, candidate_size * i : candidate_size * (i + 1)
+                    ]
+                    .view(-1)
+                    .float()
+                    .numpy()
+                )
+                query_mt_target_labels = (
+                    mt_target_labels[  # pyre-ignore [16,61]
+                        0, candidate_size * i : candidate_size * (i + 1)
+                    ]
+                    .view(-1)
+                    .float()
+                    .numpy()
+                )
+                query_mt_target_weights = (
+                    mt_target_weights[  # pyre-ignore [61]
+                        0, candidate_size * i : candidate_size * (i + 1)
+                    ]
+                    .view(-1)
+                    .float()
+                    .numpy()
+                )
+                np_array = np.concatenate(
+                    [
+                        query_mt_target_preds,
+                        query_mt_target_labels,
+                        query_mt_target_weights,
+                        np.array([candidate_size]).astype(np.float32),
+                    ]
+                )
+                response_array = array.array("B", np_array.tobytes())
+                bi = response_array.buffer_info()
+                # since we send buffer to loadgen, needs `response_array` in memory during send
+                lg.QuerySamplesComplete(
+                    [lg.QuerySampleResponse(query_id, bi[0], bi[1])]
+                )
 
     def enqueue(self, query_samples, t0: float) -> None:  # pyre-ignore [2]
         """
