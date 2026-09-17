@@ -4,7 +4,7 @@ MLPerf Results Summary
 SUT name : PySUT
 Scenario : Server
 Mode     : PerformanceOnly
-Completed samples per second    : 79.48
+Completed samples per second    : 77.63
 Result is : INVALID
   Performance constraints satisfied : NO
   Min duration satisfied : NO
@@ -24,15 +24,15 @@ Early Stopping Result:
 Additional Stats
 ================================================
 Scheduled samples per second : 1012.04
-Min latency (ns)                : 2104326628
-Max latency (ns)                : 232203161359
-Mean latency (ns)               : 114421125790
-50.00 percentile latency (ns)   : 110770631401
-90.00 percentile latency (ns)   : 209422460486
-95.00 percentile latency (ns)   : 221071952500
-97.00 percentile latency (ns)   : 224986684921
-99.00 percentile latency (ns)   : 230869893508
-99.90 percentile latency (ns)   : 232101196400
+Min latency (ns)                : 2010563920
+Max latency (ns)                : 238355432624
+Mean latency (ns)               : 122543535823
+50.00 percentile latency (ns)   : 118325808872
+90.00 percentile latency (ns)   : 215959043191
+95.00 percentile latency (ns)   : 226301515182
+97.00 percentile latency (ns)   : 230753073982
+99.00 percentile latency (ns)   : 236593467490
+99.90 percentile latency (ns)   : 238160380649
 
 ================================================
 Test Parameters Used

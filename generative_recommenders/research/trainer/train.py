@@ -294,7 +294,7 @@ def train_fn(
         logging.info(f"Rank {rank}: disabling summary writer")
 
     last_training_time = time.time()
-    torch.autograd.set_detect_anomaly(True)
+    torch.autograd.set_detect_anomaly(False)
 
     batch_id = 0
     epoch = 0

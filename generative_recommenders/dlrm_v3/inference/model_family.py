@@ -427,9 +427,9 @@ class ModelFamilyDenseDist:
                 # If -1 is received terminate all subprocesses
                 if item == -1:
                     break
-                if self.output_trace:
-                    assert profiler is not None
-                    profiler.step()
+                # if self.output_trace:
+                #     assert profiler is not None
+                #     profiler.step()
                 with torch.profiler.record_function("get_item_from_queue"):
                     # Copy here to release data in the producer to avoid invalid cuda caching allocator release.
                     item = copy.deepcopy(item)
@@ -600,9 +600,10 @@ class ModelFamilyDenseSingleWorker:
         self.output_trace = output_trace
         self.device: torch.device = torch.device("cuda:0")
         torch.cuda.set_device(self.device)
-        self.profiler: Optional[Profiler] = (
-            Profiler(rank=0) if self.output_trace else None
-        )
+        # self.profiler: Optional[Profiler] = (
+        #     Profiler(rank=0) if self.output_trace else None
+        # )
+        self.profiler = None
 
     def load(self, model_path: str) -> None:
         """
@@ -659,9 +660,9 @@ class ModelFamilyDenseSingleWorker:
         Returns:
             Tuple of (predictions, labels, weights, elapsed_time).
         """
-        if self.output_trace:
-            assert self.profiler is not None
-            self.profiler.step()
+        # if self.output_trace:
+        #     assert self.profiler is not None
+        #     self.profiler.step()
         assert (
             payload_features is not None
             and uih_seq_lengths is not None
