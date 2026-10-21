@@ -159,3 +159,4 @@ cython_debug/
 
 # trace files
 traces/
+profile/
