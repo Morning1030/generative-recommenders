@@ -20,6 +20,7 @@ model_family for dlrm_v3.
 import copy
 import functools
 import logging
+import nvtx
 import os
 import time
 import uuid
@@ -152,20 +153,29 @@ class HSTUModelFamily:
                 num_candidates,
                 dt_sparse,
             ) = self.sparse.predict(samples)
-            out = self.dense.predict(
-                seq_embeddings,
-                payload_features,
-                max_uih_len,
-                uih_seq_lengths,
-                max_num_candidates,
-                num_candidates,
-            )
-            (  # pyre-ignore [23]
-                mt_target_preds,
-                mt_target_labels,
-                mt_target_weights,
-                dt_dense,
-            ) = out
+            torch.cuda.nvtx.range_push("dense predict")
+            try:
+                out = self.dense.predict(
+                    seq_embeddings,
+                    payload_features,
+                    max_uih_len,
+                    uih_seq_lengths,
+                    max_num_candidates,
+                    num_candidates,
+                )
+                (  # pyre-ignore [23]
+                    mt_target_preds,
+                    mt_target_labels,
+                    mt_target_weights,
+                    dt_dense,
+                ) = out
+            finally:
+                torch.cuda.nvtx.range_pop()
+            # torch.cuda.nvtx.range_push("free_cpu_inputs")
+            # try:
+            #     del out, seq_embeddings, payload_features, uih_seq_lengths, num_candidates
+            # finally:
+            #     torch.cuda.nvtx.range_pop()
             return (
                 mt_target_preds,
                 mt_target_labels,
@@ -303,18 +313,23 @@ class ModelFamilySparseDist:
             uih_features = samples.uih_features_kjt
             candidates_features = samples.candidates_features_kjt
             t0: float = time.time()
-            (
-                seq_embeddings,
-                payload_features,
-                max_uih_len,
-                uih_seq_lengths,
-                max_num_candidates,
-                num_candidates,
-            ) = module(
-                uih_features=uih_features,
-                candidates_features=candidates_features,
-            )
-            dt_sparse: float = time.time() - t0
+            torch.cuda.nvtx.range_push("Embedding Lookup")
+            try:
+                (
+                    seq_embeddings,
+                    payload_features,
+                    max_uih_len,
+                    uih_seq_lengths,
+                    max_num_candidates,
+                    num_candidates,
+                ) = module(
+                    uih_features=uih_features,
+                    candidates_features=candidates_features,
+                )
+                dt_sparse: float = time.time() - t0
+            finally:
+                torch.cuda.nvtx.range_pop()
+                # logger.warning(f"[dtype] { {k: (str(v.embedding.dtype), v.embedding.numel() * v.embedding.element_size() // 2**20) for k, v in seq_embeddings.items()} }")
             return (
                 seq_embeddings,
                 payload_features,
@@ -542,30 +557,42 @@ class ModelFamilyDenseDist:
             and uih_seq_lengths is not None
         )
         t0: float = time.time()
-        seq_embeddings, payload_features, uih_seq_lengths, num_candidates = (
-            move_sparse_output_to_device(
-                seq_embeddings=seq_embeddings,
-                payload_features=payload_features,
-                uih_seq_lengths=uih_seq_lengths,
-                num_candidates=num_candidates,
-                device=device,
+        torch.cuda.nvtx.range_push("dense.H2D")
+        try:
+            seq_embeddings, payload_features, uih_seq_lengths, num_candidates = (
+                move_sparse_output_to_device(
+                    seq_embeddings=seq_embeddings,
+                    payload_features=payload_features,
+                    uih_seq_lengths=uih_seq_lengths,
+                    num_candidates=num_candidates,
+                    device=device,
+                )
             )
-        )
-        self.samples_q[rank].put(
-            (
-                id,
-                seq_embeddings,
-                payload_features,
-                max_uih_len,
-                uih_seq_lengths,
-                max_num_candidates,
-                num_candidates,
+        finally:
+            torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("dense.dispatch")
+        try:
+            self.samples_q[rank].put(
+                (
+                    id,
+                    seq_embeddings,
+                    payload_features,
+                    max_uih_len,
+                    uih_seq_lengths,
+                    max_num_candidates,
+                    num_candidates,
+                )
             )
-        )
-        (mt_target_preds, mt_target_labels, mt_target_weights) = self.capture_output(
-            id, rank
-        )
-        dt_dense = time.time() - t0
+        finally:
+            torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("wait dense result")
+        try:
+            (mt_target_preds, mt_target_labels, mt_target_weights) = self.capture_output(
+                id, rank
+            )
+            dt_dense = time.time() - t0
+        finally:
+            torch.cuda.nvtx.range_pop()
         return (
             mt_target_preds,
             mt_target_labels,
@@ -671,36 +698,56 @@ class ModelFamilyDenseSingleWorker:
         )
         t0: float = time.time()
         with torch.profiler.record_function("dense forward"):
-            seq_embeddings, payload_features, uih_seq_lengths, num_candidates = (
-                move_sparse_output_to_device(
+            torch.cuda.nvtx.range_push("dense H2D")
+            try:
+                seq_embeddings, payload_features, uih_seq_lengths, num_candidates = (
+                    move_sparse_output_to_device(
+                        seq_embeddings=seq_embeddings,
+                        payload_features=payload_features,
+                        uih_seq_lengths=uih_seq_lengths,
+                        num_candidates=num_candidates,
+                        device=self.device,
+                    )
+                )
+            finally:
+                torch.cuda.nvtx.range_pop()
+            assert self.model is not None
+            torch.cuda.nvtx.range_push("dense forward")
+            try:
+                (
+                    _,
+                    _,
+                    _,
+                    mt_target_preds,
+                    mt_target_labels,
+                    mt_target_weights,
+                ) = self.model.main_forward(  # pyre-ignore [29]
                     seq_embeddings=seq_embeddings,
                     payload_features=payload_features,
+                    max_uih_len=max_uih_len,
                     uih_seq_lengths=uih_seq_lengths,
+                    max_num_candidates=max_num_candidates,
                     num_candidates=num_candidates,
-                    device=self.device,
                 )
-            )
-            assert self.model is not None
-            (
-                _,
-                _,
-                _,
-                mt_target_preds,
-                mt_target_labels,
-                mt_target_weights,
-            ) = self.model.main_forward(  # pyre-ignore [29]
-                seq_embeddings=seq_embeddings,
-                payload_features=payload_features,
-                max_uih_len=max_uih_len,
-                uih_seq_lengths=uih_seq_lengths,
-                max_num_candidates=max_num_candidates,
-                num_candidates=num_candidates,
-            )
+            finally:
+                torch.cuda.nvtx.range_pop()
             assert mt_target_preds is not None
-            mt_target_preds = mt_target_preds.detach().to(device="cpu")
-            if mt_target_labels is not None:
-                mt_target_labels = mt_target_labels.detach().to(device="cpu")
-            if mt_target_weights is not None:
-                mt_target_weights = mt_target_weights.detach().to(device="cpu")
-            dt_dense: float = time.time() - t0
-            return mt_target_preds, mt_target_labels, mt_target_weights, dt_dense
+            torch.cuda.nvtx.range_push("Wait GPU")
+            try:
+                torch.cuda.current_stream().synchronize()   # 只是把原本藏在 .to("cpu") 裡的等待拆出來
+            finally:
+                torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("D2H Transfer")
+            try:
+                mt_target_preds = mt_target_preds.detach().to(device="cpu")
+                if mt_target_labels is not None:
+                    mt_target_labels = mt_target_labels.detach().to(device="cpu")
+                if mt_target_weights is not None:
+                    mt_target_weights = mt_target_weights.detach().to(device="cpu")
+                dt_dense: float = time.time() - t0
+                return mt_target_preds, mt_target_labels, mt_target_weights, dt_dense
+            finally:
+                torch.cuda.nvtx.range_pop()
+
+
+    

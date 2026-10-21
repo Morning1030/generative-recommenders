@@ -30,6 +30,7 @@ import time
 from typing import Any, Dict, List, Optional, Union
 
 import gin
+import nvtx
 
 # pyre-ignore [21]
 import mlperf_loadgen as lg  # @manual
@@ -56,7 +57,7 @@ from generative_recommenders.dlrm_v3.utils import (
     profiler_or_nullcontext,
     SUPPORTED_DATASETS,
 )
-
+# sys.setswitchinterval(0.0005)
 
 logger: logging.Logger = logging.getLogger("main")
 
@@ -142,6 +143,7 @@ class Runner:
         self.current_t0: List[float] = []
         self.num_queries: int = num_queries
         self.processed_queries: int = 0
+        self._wait_rids = {}
 
     def run_one_item(self, qitem: QueryItem) -> None:
         """
@@ -155,29 +157,33 @@ class Runner:
         try:
             t0_prediction: float = time.time()
             prediction_output = self.model.predict(qitem.samples)
-            dt_prediction: float = time.time() - t0_prediction
-            assert prediction_output is not None
-            (
-                mt_target_preds,
-                mt_target_labels,
-                mt_target_weights,
-                dt_sparse,
-                dt_dense,
-            ) = prediction_output
-            if self.compute_eval:
-                assert mt_target_labels is not None
-                assert mt_target_weights is not None
-            self.result_timing.append(
-                {
-                    "total": time.time() - qitem.start,
-                    "prediction": dt_prediction,
-                    "queue": qitem.dt_queue,
-                    "batching": qitem.dt_batching,
-                    "sparse": dt_sparse,
-                    "dense": dt_dense,
-                }
-            )
-            self.result_batches.append(len(qitem.query_ids))
+            torch.cuda.nvtx.range_push("after_predict")
+            try:
+                dt_prediction: float = time.time() - t0_prediction
+                assert prediction_output is not None
+                (
+                    mt_target_preds,
+                    mt_target_labels,
+                    mt_target_weights,
+                    dt_sparse,
+                    dt_dense,
+                ) = prediction_output
+                if self.compute_eval:
+                    assert mt_target_labels is not None
+                    assert mt_target_weights is not None
+                self.result_timing.append(
+                    {
+                        "total": time.time() - qitem.start,
+                        "prediction": dt_prediction,
+                        "queue": qitem.dt_queue,
+                        "batching": qitem.dt_batching,
+                        "sparse": dt_sparse,
+                        "dense": dt_dense,
+                    }
+                )
+                self.result_batches.append(len(qitem.query_ids))
+            finally:
+                torch.cuda.nvtx.range_pop()
         except Exception as ex:  # pylint: disable=broad-except
             logger.error("thread: failed, %s", ex)
             return
@@ -187,64 +193,76 @@ class Runner:
             return
 
         # pyrefly: ignore [unbound-name]
-        candidate_size = mt_target_preds.size(1) // len(qitem.query_ids)
-        if not self.compute_eval:
-            for i, query_id in enumerate(qitem.query_ids):
-                query_mt_target_preds = (
-                    mt_target_preds[  # pyre-ignore [61]
-                        0,
-                        candidate_size * i : candidate_size * (i + 1),
+        torch.cuda.nvtx.range_push("postprocess")
+        try:
+            candidate_size = mt_target_preds.size(1) // len(qitem.query_ids)
+            if not self.compute_eval:
+                for i, query_id in enumerate(qitem.query_ids):
+                    query_mt_target_preds = (
+                        mt_target_preds[  # pyre-ignore [61]
+                            0,
+                            candidate_size * i : candidate_size * (i + 1),
+                            ]
+                            .view(-1)
+                            .float()
+                            .numpy()
+                    )
+                    response_array = array.array("B", query_mt_target_preds.tobytes())
+                    bi = response_array.buffer_info()
+                    # since we send buffer to loadgen, needs `response_array` in memory during send
+                    torch.cuda.nvtx.range_push("QuerySamplesComplete")
+                    try:
+                        lg.QuerySamplesComplete(
+                            [lg.QuerySampleResponse(query_id, bi[0], bi[1])]
+                        )
+                    finally:
+                        torch.cuda.nvtx.range_pop()
+            else:
+                for i, query_id in enumerate(qitem.query_ids):
+                    query_mt_target_preds = (
+                        mt_target_preds[  # pyre-ignore [61]
+                            0, candidate_size * i : candidate_size * (i + 1)
                         ]
                         .view(-1)
                         .float()
                         .numpy()
-                )
-                response_array = array.array("B", query_mt_target_preds.tobytes())
-                bi = response_array.buffer_info()
-                # since we send buffer to loadgen, needs `response_array` in memory during send
-                lg.QuerySamplesComplete(
-                    [lg.QuerySampleResponse(query_id, bi[0], bi[1])]
-                )
-        else:
-            for i, query_id in enumerate(qitem.query_ids):
-                query_mt_target_preds = (
-                    mt_target_preds[  # pyre-ignore [61]
-                        0, candidate_size * i : candidate_size * (i + 1)
-                    ]
-                    .view(-1)
-                    .float()
-                    .numpy()
-                )
-                query_mt_target_labels = (
-                    mt_target_labels[  # pyre-ignore [16,61]
-                        0, candidate_size * i : candidate_size * (i + 1)
-                    ]
-                    .view(-1)
-                    .float()
-                    .numpy()
-                )
-                query_mt_target_weights = (
-                    mt_target_weights[  # pyre-ignore [61]
-                        0, candidate_size * i : candidate_size * (i + 1)
-                    ]
-                    .view(-1)
-                    .float()
-                    .numpy()
-                )
-                np_array = np.concatenate(
-                    [
-                        query_mt_target_preds,
-                        query_mt_target_labels,
-                        query_mt_target_weights,
-                        np.array([candidate_size]).astype(np.float32),
-                    ]
-                )
-                response_array = array.array("B", np_array.tobytes())
-                bi = response_array.buffer_info()
-                # since we send buffer to loadgen, needs `response_array` in memory during send
-                lg.QuerySamplesComplete(
-                    [lg.QuerySampleResponse(query_id, bi[0], bi[1])]
-                )
+                    )
+                    query_mt_target_labels = (
+                        mt_target_labels[  # pyre-ignore [16,61]
+                            0, candidate_size * i : candidate_size * (i + 1)
+                        ]
+                        .view(-1)
+                        .float()
+                        .numpy()
+                    )
+                    query_mt_target_weights = (
+                        mt_target_weights[  # pyre-ignore [61]
+                            0, candidate_size * i : candidate_size * (i + 1)
+                        ]
+                        .view(-1)
+                        .float()
+                        .numpy()
+                    )
+                    np_array = np.concatenate(
+                        [
+                            query_mt_target_preds,
+                            query_mt_target_labels,
+                            query_mt_target_weights,
+                            np.array([candidate_size]).astype(np.float32),
+                        ]
+                    )
+                    response_array = array.array("B", np_array.tobytes())
+                    bi = response_array.buffer_info()
+                    # since we send buffer to loadgen, needs `response_array` in memory during send
+                    torch.cuda.nvtx.range_push("QuerySamplesComplete")
+                    try:
+                        lg.QuerySamplesComplete(
+                            [lg.QuerySampleResponse(query_id, bi[0], bi[1])]
+                        )
+                    finally:
+                        torch.cuda.nvtx.range_pop()
+        finally:
+            torch.cuda.nvtx.range_pop()
 
     def enqueue(self, query_samples, t0: float) -> None:  # pyre-ignore [2]
         """
@@ -256,6 +274,9 @@ class Runner:
             query_samples: List of LoadGen query sample objects.
             t0: Timestamp when this batch started.
         """
+        for q in query_samples:
+            self._wait_rids[q.id] = torch.cuda.nvtx.range_start("query_wait")
+
         self.current_query_ids.extend([q.id for q in query_samples])
         self.current_content_ids.extend([q.index for q in query_samples])
         self.current_t0.append(t0)
@@ -266,28 +287,42 @@ class Runner:
             self.processed_queries >= self.num_queries
             or len(self.current_query_ids) >= self.batchsize
         ):
-            for i in range(len(self.current_query_ids) // self.batchsize):
-                self.data_producer.enqueue(
-                    query_ids=self.current_query_ids[
-                        i * self.batchsize : (i + 1) * self.batchsize
-                    ],
-                    content_ids=self.current_content_ids[
-                        i * self.batchsize : (i + 1) * self.batchsize
-                    ],
-                    t0=t0,
-                    dt_queue=dt_queue,
-                )
-            remaining_s: int = len(self.current_query_ids) % self.batchsize
-            if remaining_s > 0:
-                self.data_producer.enqueue(
-                    query_ids=self.current_query_ids[-remaining_s:],
-                    content_ids=self.current_content_ids[-remaining_s:],
-                    t0=t0,
-                    dt_queue=dt_queue,
-                )
-            self.current_query_ids = []
-            self.current_content_ids = []
-            self.current_t0 = []
+            torch.cuda.nvtx.range_push(f"enqueue:dispatch n={len(self.current_query_ids)}")
+            try:
+                for i in range(len(self.current_query_ids) // self.batchsize):
+                    ids = self.current_query_ids[i*self.batchsize:(i+1)*self.batchsize]
+                    for qid in ids:
+                        rid = self._wait_rids.pop(qid, None)
+                        if rid is not None:
+                            torch.cuda.nvtx.range_end(rid)
+                    self.data_producer.enqueue(
+                        query_ids=self.current_query_ids[
+                            i * self.batchsize : (i + 1) * self.batchsize
+                        ],
+                        content_ids=self.current_content_ids[
+                            i * self.batchsize : (i + 1) * self.batchsize
+                        ],
+                        t0=t0,
+                        dt_queue=dt_queue,
+                    )
+                remaining_s: int = len(self.current_query_ids) % self.batchsize
+                if remaining_s > 0:
+                    ids = self.current_query_ids[-remaining_s:]
+                    for qid in ids:
+                        rid = self._wait_rids.pop(qid, None)
+                        if rid is not None:
+                            torch.cuda.nvtx.range_end(rid)
+                    self.data_producer.enqueue(
+                        query_ids=self.current_query_ids[-remaining_s:],
+                        content_ids=self.current_content_ids[-remaining_s:],
+                        t0=t0,
+                        dt_queue=dt_queue,
+                    )
+                self.current_query_ids = []
+                self.current_content_ids = []
+                self.current_t0 = []
+            finally:
+                torch.cuda.nvtx.range_pop()
 
     def finish(self) -> None:
         """Signal data producer to finish and wait for completion."""
@@ -671,136 +706,150 @@ def run(
     model_family.load(model_path)
 
     # warmup
-    for autotune_bs in range(batchsize, 0, -1):
-        logger.warning(f"Autotune for batch size {autotune_bs}")
-        warmup_ids = list(range(autotune_bs))
-        ds.load_query_samples(warmup_ids)
-        for _ in range(4 * int(os.environ.get("WORLD_SIZE", 1))):
+    torch.cuda.nvtx.range_push("DLRMv3::Warmup Run")
+    try:
+        for autotune_bs in range(batchsize, 0, -1):
+            logger.warning(f"Autotune for batch size {autotune_bs}")
+            warmup_ids = list(range(autotune_bs))
+            ds.load_query_samples(warmup_ids)
+            for _ in range(4 * int(os.environ.get("WORLD_SIZE", 1))):
+                if is_streaming:
+                    ds.init_sut()  # pyre-ignore [16]
+                sample: Union[Samples, List[Samples]] = ds.get_samples(warmup_ids)
+                if isinstance(sample, Samples):
+                    model_family.predict(sample)
+                else:
+                    for s in sample:
+                        model_family.predict(s)
+            ds.unload_query_samples(None)
+        for h in logger.handlers:
+            h.flush()
+        logger.info("Model forward warmup done")
+
+        count = int(
+            ds.get_item_count() * dataset_percentage
+            if not is_streaming
+            else ds.get_item_count()
+        )
+        train_size: int = round(train_split_percentage * count) if not is_streaming else 0
+        if compute_eval:
+            count = count - train_size
+
+        runner: Runner = Runner(
+            model_family,
+            ds,
+            data_producer_threads=data_producer_threads,
+            batchsize=batchsize,
+            compute_eval=compute_eval,
+            num_queries=count,
+        )
+
+        def issue_queries(query_samples) -> None:  # pyre-ignore [2]
+            torch.cuda.nvtx.range_push("issue_queries")
+            try:
+                if compute_eval:
+                    for sample in query_samples:
+                        sample.index = sample.index + train_size
+                runner.enqueue(query_samples, time.time())
+            finally:
+                torch.cuda.nvtx.range_pop()
+
+        def load_query_samples(query_ids: List[int]) -> None:
+            if compute_eval:
+                query_ids = [q + train_size for q in query_ids]
+            ds.load_query_samples(query_ids)
+
+        def flush_queries() -> None:
+            pass
+
+        if scenario == lg.TestScenario.Server:
+            # inference benchmark warmup
             if is_streaming:
-                ds.init_sut()  # pyre-ignore [16]
-            sample: Union[Samples, List[Samples]] = ds.get_samples(warmup_ids)
-            if isinstance(sample, Samples):
-                model_family.predict(sample)
+                # pyrefly: ignore [missing-attribute]
+                ds.init_sut()
+                warmup_count: int = sum(
+                    ds.get_num_unique_requests(  # pyre-ignore [16]
+                        warmup_ratio=warmup_ratio
+                    )
+                )
             else:
-                for s in sample:
-                    model_family.predict(s)
-        ds.unload_query_samples(None)
-    for h in logger.handlers:
-        h.flush()
-    logger.info("Model forward warmup done")
+                warmup_count: int = int(count * warmup_ratio)
+            runner.reset_states(num_queries=warmup_count)
+            final_results = {
+                "runtime": model_family.name(),
+                "version": model_family.version(),
+                "time": int(time.time()),
+                "scenario": str(scenario),
+            }
+            settings.min_query_count = warmup_count
+            settings.max_query_count = warmup_count
+            sut = lg.ConstructSUT(issue_queries, flush_queries)
+            qsl = lg.ConstructQSL(
+                warmup_count,
+                warmup_count,
+                load_query_samples,
+                ds.unload_query_samples,
+            )
+            with profiler_or_nullcontext(enabled=output_trace, with_stack=False):
+                logger.info(f"starting warmup {scenario} with {warmup_count} queries")
+                lg.StartTest(sut, qsl, settings)
+                lg.DestroyQSL(qsl)
+                lg.DestroySUT(sut)
+    finally:
+        torch.cuda.nvtx.range_pop()
 
-    count = int(
-        ds.get_item_count() * dataset_percentage
-        if not is_streaming
-        else ds.get_item_count()
-    )
-    train_size: int = round(train_split_percentage * count) if not is_streaming else 0
-    if compute_eval:
-        count = count - train_size
-
-    runner: Runner = Runner(
-        model_family,
-        ds,
-        data_producer_threads=data_producer_threads,
-        batchsize=batchsize,
-        compute_eval=compute_eval,
-        num_queries=count,
-    )
-
-    def issue_queries(query_samples) -> None:  # pyre-ignore [2]
-        if compute_eval:
-            for sample in query_samples:
-                sample.index = sample.index + train_size
-        runner.enqueue(query_samples, time.time())
-
-    def load_query_samples(query_ids: List[int]) -> None:
-        if compute_eval:
-            query_ids = [q + train_size for q in query_ids]
-        ds.load_query_samples(query_ids)
-
-    def flush_queries() -> None:
-        pass
-
-    if scenario == lg.TestScenario.Server:
-        # inference benchmark warmup
+    # official run
+    torch.cuda.profiler.start()
+    torch.cuda.nvtx.range_push("DLRMv3::Official Run")
+    try:
         if is_streaming:
             # pyrefly: ignore [missing-attribute]
             ds.init_sut()
-            warmup_count: int = sum(
-                ds.get_num_unique_requests(  # pyre-ignore [16]
-                    warmup_ratio=warmup_ratio
-                )
-            )
-        else:
-            warmup_count: int = int(count * warmup_ratio)
-        runner.reset_states(num_queries=warmup_count)
         final_results = {
             "runtime": model_family.name(),
             "version": model_family.version(),
             "time": int(time.time()),
             "scenario": str(scenario),
         }
-        settings.min_query_count = warmup_count
-        settings.max_query_count = warmup_count
+        query_size: int = get_num_queries(
+            input_size=num_queries,
+            one_pass_size=count,
+            scenario_name=scenario_name,
+            offline_target_qps=settings.offline_expected_qps,
+            target_duration=settings.min_duration_ms,
+        )
+        settings.min_query_count = query_size
+        settings.max_query_count = query_size
+        runner.reset_states(num_queries=query_size if not compute_eval else count)
         sut = lg.ConstructSUT(issue_queries, flush_queries)
         qsl = lg.ConstructQSL(
-            warmup_count,
-            warmup_count,
+            count,
+            count,
             load_query_samples,
             ds.unload_query_samples,
         )
         with profiler_or_nullcontext(enabled=output_trace, with_stack=False):
-            logger.info(f"starting warmup {scenario} with {warmup_count} queries")
+            logger.info(
+                f"starting {scenario} with {query_size} queries and {query_size // count} repeats"
+            )
             lg.StartTest(sut, qsl, settings)
+            runner.finish()
+            # pyrefly: ignore [bad-assignment]
+            final_results["took"] = time.time() - ds.last_loaded
             lg.DestroyQSL(qsl)
             lg.DestroySUT(sut)
 
-    # official run
-    if is_streaming:
-        # pyrefly: ignore [missing-attribute]
-        ds.init_sut()
-    final_results = {
-        "runtime": model_family.name(),
-        "version": model_family.version(),
-        "time": int(time.time()),
-        "scenario": str(scenario),
-    }
-    query_size: int = get_num_queries(
-        input_size=num_queries,
-        one_pass_size=count,
-        scenario_name=scenario_name,
-        offline_target_qps=settings.offline_expected_qps,
-        target_duration=settings.min_duration_ms,
-    )
-    settings.min_query_count = query_size
-    settings.max_query_count = query_size
-    runner.reset_states(num_queries=query_size if not compute_eval else count)
-    sut = lg.ConstructSUT(issue_queries, flush_queries)
-    qsl = lg.ConstructQSL(
-        count,
-        count,
-        load_query_samples,
-        ds.unload_query_samples,
-    )
-    with profiler_or_nullcontext(enabled=output_trace, with_stack=False):
-        logger.info(
-            f"starting {scenario} with {query_size} queries and {query_size // count} repeats"
+        add_results(
+            final_results,
+            runner.result_timing,
+            runner.result_batches,
         )
-        lg.StartTest(sut, qsl, settings)
-        runner.finish()
-        # pyrefly: ignore [bad-assignment]
-        final_results["took"] = time.time() - ds.last_loaded
-        lg.DestroyQSL(qsl)
-        lg.DestroySUT(sut)
-
-    add_results(
-        final_results,
-        runner.result_timing,
-        runner.result_batches,
-    )
-    # If multiple subprocesses are running the model send a signal to stop them
-    if int(os.environ.get("WORLD_SIZE", 1)) > 1:
-        model_family.predict(None)
+        # If multiple subprocesses are running the model send a signal to stop them
+        if int(os.environ.get("WORLD_SIZE", 1)) > 1:
+            model_family.predict(None)
+    finally:
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.profiler.stop()
 
 
 def main() -> None:

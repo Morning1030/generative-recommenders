@@ -143,7 +143,7 @@ class MultiThreadDataProducer:
         self.ds = ds
         self.threads = threads
         self.run_one_item = run_one_item  # pyre-ignore [4]
-        self.tasks: Queue[Optional[Tuple[List[int], List[int], float, float]]] = Queue(
+        self.tasks: Queue[Optional[Tuple[List[int], List[int], float, float, int]]] = Queue(
             maxsize=threads * queue_size_multiplier
         )
         self.workers: List[threading.Thread] = []
@@ -154,7 +154,7 @@ class MultiThreadDataProducer:
             worker.start()
 
     def handle_tasks(
-        self, tasks_queue: Queue[Optional[Tuple[List[int], List[int], float, float]]]
+        self, tasks_queue: Queue[Optional[Tuple[List[int], List[int], float, float, int]]]
     ) -> None:
         """
         Worker thread main loop to process tasks from the queue.
@@ -166,38 +166,52 @@ class MultiThreadDataProducer:
         """
         stream = torch.cuda.Stream()
         while True:
-            query_and_content_ids = tasks_queue.get()
+            torch.cuda.nvtx.range_push("worker.wait_task")
+            try:
+                query_and_content_ids = tasks_queue.get()
+            finally:
+                torch.cuda.nvtx.range_pop()
             if query_and_content_ids is None:
                 tasks_queue.task_done()
                 break
-            query_ids, content_ids, t0, dt_queue = query_and_content_ids
-            t0_batching: float = time.time()
-            samples: Union[Samples, List[Samples]] = self.ds.get_samples(content_ids)
-            dt_batching: float = time.time() - t0_batching
-            if isinstance(samples, Samples):
-                qitem = QueryItem(
-                    query_ids=query_ids,
-                    samples=samples,
-                    start=t0,
-                    dt_queue=dt_queue,
-                    dt_batching=dt_batching,
-                )
-                with torch.inference_mode(), torch.cuda.stream(stream):
-                    self.run_one_item(qitem)
-            else:
-                start_idx = 0
-                for sample in samples:
-                    batch_size: int = sample.batch_size()
+            query_ids, content_ids, t0, dt_queue, rid = query_and_content_ids
+            torch.cuda.nvtx.range_end(rid)
+            torch.cuda.nvtx.range_push(f"worker.batch bs={len(content_ids)}")
+            try:
+                t0_batching: float = time.time()
+                torch.cuda.nvtx.range_push("get_samples")
+                try:
+                    samples: Union[Samples, List[Samples]] = self.ds.get_samples(content_ids)
+                finally:
+                    torch.cuda.nvtx.range_pop()
+                dt_batching: float = time.time() - t0_batching
+
+                if isinstance(samples, Samples):
                     qitem = QueryItem(
-                        query_ids=query_ids[start_idx : start_idx + batch_size],
-                        samples=sample,
+                        query_ids=query_ids,
+                        samples=samples,
                         start=t0,
                         dt_queue=dt_queue,
                         dt_batching=dt_batching,
                     )
-                    start_idx += batch_size
                     with torch.inference_mode(), torch.cuda.stream(stream):
                         self.run_one_item(qitem)
+                else:
+                    start_idx = 0
+                    for sample in samples:
+                        batch_size: int = sample.batch_size()
+                        qitem = QueryItem(
+                            query_ids=query_ids[start_idx : start_idx + batch_size],
+                            samples=sample,
+                            start=t0,
+                            dt_queue=dt_queue,
+                            dt_batching=dt_batching,
+                        )
+                        start_idx += batch_size
+                        with torch.inference_mode(), torch.cuda.stream(stream):
+                            self.run_one_item(qitem)
+            finally:
+                torch.cuda.nvtx.range_pop()
             tasks_queue.task_done()
 
     def enqueue(
@@ -213,7 +227,12 @@ class MultiThreadDataProducer:
             dt_queue: Time spent waiting in the queue.
         """
         with torch.profiler.record_function("data batching"):
-            self.tasks.put((query_ids, content_ids, t0, dt_queue))
+            rid = torch.cuda.nvtx.range_start("task_queue_wait")
+            torch.cuda.nvtx.range_push(f"producer.put qsize={self.tasks.qsize()}")
+            try:
+                self.tasks.put((query_ids, content_ids, t0, dt_queue, rid))
+            finally:
+                torch.cuda.nvtx.range_pop()
 
     def finish(self) -> None:
         """
